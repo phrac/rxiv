@@ -1,8 +1,9 @@
 use image::AnimationDecoder;
 use softbuffer::{Context, Surface};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -204,8 +205,11 @@ fn load_image(path: &Path) -> Option<DecodedImage> {
         return Some(animated);
     }
 
-    // static image
-    let img = image::open(path).ok()?;
+    // static image — guess format from content, not extension, so
+    // misnamed files (e.g. webp saved as .jpg) still load
+    let reader = image::ImageReader::open(path).ok()?;
+    let reader = reader.with_guessed_format().ok()?;
+    let img = reader.decode().ok()?;
     let (width, height) = (img.width(), img.height());
     let rgba = img.to_rgba8();
     let pixels = rgba_to_packed(rgba.as_raw());
@@ -221,6 +225,70 @@ fn load_image(path: &Path) -> Option<DecodedImage> {
     })
 }
 
+struct ImageCache {
+    cache: HashMap<usize, DecodedImage>,
+    tx: mpsc::Sender<(usize, PathBuf)>,
+    rx: mpsc::Receiver<(usize, DecodedImage)>,
+    pending: Arc<Mutex<usize>>, // generation counter to discard stale results
+    generation: usize,
+}
+
+impl ImageCache {
+    fn new() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<(usize, PathBuf)>();
+        let (res_tx, res_rx) = mpsc::channel::<(usize, DecodedImage)>();
+        let pending = Arc::new(Mutex::new(0usize));
+        let bg_pending = Arc::clone(&pending);
+
+        std::thread::spawn(move || {
+            while let Ok((idx, path)) = req_rx.recv() {
+                let gen_before = *bg_pending.lock().unwrap();
+                if let Some(img) = load_image(&path) {
+                    let gen_after = *bg_pending.lock().unwrap();
+                    if gen_before == gen_after {
+                        let _ = res_tx.send((idx, img));
+                    }
+                }
+            }
+        });
+
+        Self {
+            cache: HashMap::new(),
+            tx: req_tx,
+            rx: res_rx,
+            pending,
+            generation: 0,
+        }
+    }
+
+    fn drain_ready(&mut self) {
+        while let Ok((idx, img)) = self.rx.try_recv() {
+            self.cache.insert(idx, img);
+        }
+    }
+
+    fn take(&mut self, idx: usize) -> Option<DecodedImage> {
+        self.drain_ready();
+        self.cache.remove(&idx)
+    }
+
+    fn request_preload(&mut self, images: &[PathBuf], center: usize) {
+        self.generation += 1;
+        *self.pending.lock().unwrap() = self.generation;
+        self.cache.clear();
+        // drain any stale results
+        while self.rx.try_recv().is_ok() {}
+
+        let len = images.len();
+        for delta in [1isize, -1] {
+            let idx = (center as isize + delta).rem_euclid(len as isize) as usize;
+            if idx != center {
+                let _ = self.tx.send((idx, images[idx].clone()));
+            }
+        }
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
@@ -228,6 +296,7 @@ struct App {
     images: Vec<PathBuf>,
     index: usize,
     current: Option<DecodedImage>,
+    image_cache: ImageCache,
     zoom: f64,
     pan_x: f64,
     pan_y: f64,
@@ -244,6 +313,7 @@ impl App {
             images,
             index,
             current: None,
+            image_cache: ImageCache::new(),
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
@@ -253,7 +323,9 @@ impl App {
     }
 
     fn load_current(&mut self) {
-        self.current = self.images.get(self.index).and_then(|p| load_image(p));
+        self.current = self.image_cache.take(self.index).or_else(|| {
+            self.images.get(self.index).and_then(|p| load_image(p))
+        });
         self.zoom = 1.0;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
@@ -261,6 +333,7 @@ impl App {
         self.frame_start = Instant::now();
         self.update_title();
         self.request_redraw();
+        self.image_cache.request_preload(&self.images, self.index);
     }
 
     fn update_title(&self) {
@@ -352,31 +425,41 @@ impl App {
             let x_end = (ox + scaled_w).max(0).min(w as i64) as u32;
             let y_end = (oy + scaled_h).max(0).min(img_area_h as i64) as u32;
 
+            // fixed-point inverse scale (16.16) to replace per-pixel f64 division
+            let inv_scale = (65536.0 / scale) as u64;
+            let img_w = img.width as usize;
+
+            // precompute src_x lookup table for the x span
+            let x_span = (x_end - x_start) as usize;
+            let mut src_x_table: Vec<u32> = Vec::with_capacity(x_span);
+            for wx in x_start..x_end {
+                src_x_table.push((((wx as i64 - ox) as u64 * inv_scale) >> 16) as u32);
+            }
+
+            let buf = buffer.as_mut();
             for wy in y_start..y_end {
-                let src_y = ((wy as i64 - oy) as f64 / scale) as u32;
+                let src_y = (((wy as i64 - oy) as u64 * inv_scale) >> 16) as u32;
                 if src_y >= img.height {
                     continue;
                 }
-                let row_offset = (src_y * img.width) as usize;
-                let buf_row = (wy * w) as usize;
+                let row_offset = src_y as usize * img_w;
+                let buf_row = wy as usize * w as usize;
 
-                for wx in x_start..x_end {
-                    let src_x = ((wx as i64 - ox) as f64 / scale) as u32;
-                    if src_x >= img.width {
-                        continue;
+                // SAFETY: x_start..x_end is clamped to 0..w, so buf_row + wx < w*h = buf.len()
+                // src_x < img.width and src_y < img.height, so row_offset + src_x < frame_pixels.len()
+                unsafe {
+                    for (i, &src_x) in src_x_table.iter().enumerate() {
+                        let px = *frame_pixels.get_unchecked(row_offset + src_x as usize);
+                        *buf.get_unchecked_mut(buf_row + x_start as usize + i) = px;
                     }
-                    buffer[buf_row + wx as usize] = frame_pixels[row_offset + src_x as usize];
                 }
             }
         }
 
         // draw status bar background
-        for y in img_area_h..h {
-            let row = (y * w) as usize;
-            for x in 0..w {
-                buffer[row + x as usize] = BAR_BG;
-            }
-        }
+        let bar_start = img_area_h as usize * w as usize;
+        let bar_end = h as usize * w as usize;
+        buffer[bar_start..bar_end].fill(BAR_BG);
 
         // draw status bar text
         if let Some(path) = self.images.get(self.index) {
