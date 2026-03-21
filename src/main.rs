@@ -1,4 +1,5 @@
 use image::AnimationDecoder;
+use serde::Deserialize;
 use softbuffer::{Context, Surface};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -17,6 +18,42 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "ico", "pnm", "pbm", "pgm",
     "ppm", "qoi",
 ];
+
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    keys: HashMap<String, String>,
+}
+
+impl Config {
+    fn load() -> Self {
+        let config_path = dirs_config_path().join("config.toml");
+        let Ok(text) = std::fs::read_to_string(&config_path) else {
+            return Self::default();
+        };
+        match toml::from_str(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: failed to parse {}: {}", config_path.display(), e);
+                Self::default()
+            }
+        }
+    }
+
+    fn command_for_key(&self, key: &str) -> Option<&str> {
+        self.keys.get(key).map(|s| s.as_str())
+    }
+}
+
+fn dirs_config_path() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg).join("rxiv")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/rxiv")
+    } else {
+        PathBuf::from(".config/rxiv")
+    }
+}
 
 fn collect_images(path: &Path) -> Vec<PathBuf> {
     let dir = if path.is_dir() {
@@ -297,6 +334,7 @@ struct App {
     index: usize,
     current: Option<DecodedImage>,
     image_cache: ImageCache,
+    config: Config,
     zoom: f64,
     pan_x: f64,
     pan_y: f64,
@@ -305,7 +343,7 @@ struct App {
 }
 
 impl App {
-    fn new(images: Vec<PathBuf>, index: usize) -> Self {
+    fn new(images: Vec<PathBuf>, index: usize, config: Config) -> Self {
         Self {
             window: None,
             context: None,
@@ -314,6 +352,7 @@ impl App {
             index,
             current: None,
             image_cache: ImageCache::new(),
+            config,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
@@ -528,6 +567,42 @@ impl App {
         self.load_current();
     }
 
+    fn run_key_command(&mut self, cmd: &str) {
+        if self.images.is_empty() {
+            return;
+        }
+        let path = &self.images[self.index];
+        let expanded = cmd.replace("$file", &path.to_string_lossy());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&expanded)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                // if the file was removed/moved, drop it from the list
+                if !path.exists() {
+                    self.images.remove(self.index);
+                    if self.images.is_empty() {
+                        self.current = None;
+                        self.update_title();
+                        self.request_redraw();
+                        return;
+                    }
+                    if self.index >= self.images.len() {
+                        self.index = self.images.len() - 1;
+                    }
+                    self.load_current();
+                }
+            }
+            Ok(s) => {
+                eprintln!("command exited with {}: {}", s, expanded);
+            }
+            Err(e) => {
+                eprintln!("failed to run command: {}: {}", expanded, e);
+            }
+        }
+    }
+
     fn toggle_fullscreen(&self) {
         if let Some(window) = &self.window {
             if window.fullscreen().is_some() {
@@ -710,7 +785,12 @@ impl ApplicationHandler for App {
                         self.pan_y = 0.0;
                         self.request_redraw();
                     }
-                    _ => {}
+                    key => {
+                        if let Some(cmd) = self.config.command_for_key(key) {
+                            let cmd = cmd.to_owned();
+                            self.run_key_command(&cmd);
+                        }
+                    }
                 },
                 _ => {}
             },
@@ -741,7 +821,9 @@ fn main() {
         std::process::exit(1);
     }
 
+    let config = Config::load();
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App::new(images, index);
+    let mut app = App::new(images, index, config);
     event_loop.run_app(&mut app).expect("event loop error");
 }
