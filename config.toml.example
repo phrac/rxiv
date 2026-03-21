@@ -1,0 +1,12 @@
+# rxiv example config
+# Place this file at $XDG_CONFIG_HOME/rxiv/config.toml
+# (usually ~/.config/rxiv/config.toml)
+
+# Custom keybindings
+# Map a key to a shell command. $file is replaced with the current image path.
+[keys]
+# d = "mv $file ~/.local/share/Trash/files/"
+# w = "feh --bg-fill $file"
+# r = "mogrify -rotate 90 $file"
+# y = "wl-copy < $file"
+# e = "gimp $file"
