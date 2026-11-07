@@ -89,6 +89,20 @@ const BAR_FG: u32 = 0xcccccc;
 /// canvas background; images are composited over this at decode time
 const BG: u32 = 0x1a1a1a;
 
+const ZOOM_MIN: f64 = 0.1;
+const ZOOM_MAX: f64 = 32.0;
+
+/// scale that fits the image inside the image area, never upscaling;
+/// shared by the renderer, the pan clamp, and the 1:1 zoom key so the
+/// "zoom is relative to fit" formula lives in exactly one place
+fn fit_scale(img_w: u32, img_h: u32, win_w: u32, img_area_h: u32) -> f64 {
+    let ww = win_w.max(1) as f64;
+    let wh = img_area_h.max(1) as f64;
+    (ww / img_w.max(1) as f64)
+        .min(wh / img_h.max(1) as f64)
+        .min(1.0)
+}
+
 const FONT_W: u32 = 6;
 const FONT_H: u32 = 10;
 
@@ -266,7 +280,7 @@ fn blit_scaled(
 ) {
     let x_span = x_end.saturating_sub(x_start) as usize;
     let y_span = y_end.saturating_sub(y_start) as usize;
-    if x_span == 0 || y_span == 0 || !(scale.is_finite() && scale > 0.0) {
+    if x_span == 0 || y_span == 0 || pixels.is_empty() || !(scale.is_finite() && scale > 0.0) {
         return;
     }
 
@@ -342,104 +356,127 @@ fn blit_scaled(
 struct Frame {
     pixels: Vec<u32>,
     mips: Vec<Mip>,
-    delay: Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimKind {
+    Gif,
+    Apng,
+}
+
+/// Animated image kept as the encoded bytes plus per-frame delays; frames
+/// are decoded one at a time while playing, so a 1000-frame GIF costs the
+/// file size plus one decoded frame instead of a thousand raw frames.
+struct Animated {
+    kind: AnimKind,
+    bytes: Arc<Vec<u8>>,
+    delays: Vec<Duration>,
+}
+
+enum ImageData {
+    Static(Frame),
+    Animated(Animated),
 }
 
 struct DecodedImage {
     width: u32,
     height: u32,
-    frames: Vec<Frame>,
+    data: ImageData,
     file_size: u64,
 }
 
 impl DecodedImage {
     fn is_animated(&self) -> bool {
-        self.frames.len() > 1
+        matches!(self.data, ImageData::Animated(_))
+    }
+
+    fn frame_count(&self) -> usize {
+        match &self.data {
+            ImageData::Static(_) => 1,
+            ImageData::Animated(a) => a.delays.len(),
+        }
     }
 }
 
-fn try_load_animated(path: &Path) -> Option<DecodedImage> {
-    let ext = path
+/// streaming animation iterator over an owned copy of the file bytes
+type FrameStream = image::Frames<'static>;
+
+fn anim_kind_for(path: &Path) -> Option<AnimKind> {
+    match path
         .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())?;
-
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let data = std::fs::read(path).ok()?;
-    let cursor = std::io::Cursor::new(&data);
-
-    match ext.as_str() {
-        "gif" => {
-            let decoder = image::codecs::gif::GifDecoder::new(cursor).ok()?;
-            let raw_frames: Vec<_> = decoder.into_frames().collect_frames().ok()?;
-            if raw_frames.len() <= 1 {
-                return None; // not animated, fall back to normal loader
-            }
-            let width = raw_frames[0].buffer().width();
-            let height = raw_frames[0].buffer().height();
-            let frames = raw_frames
-                .into_iter()
-                .map(|f| {
-                    let (numer, denom) = f.delay().numer_denom_ms();
-                    let ms = if denom == 0 {
-                        100
-                    } else {
-                        (numer / denom).max(10)
-                    };
-                    let pixels = rgba_to_packed(f.buffer().as_raw());
-                    let mips = build_mips(width, height, &pixels);
-                    Frame {
-                        pixels,
-                        mips,
-                        delay: Duration::from_millis(ms as u64),
-                    }
-                })
-                .collect();
-            Some(DecodedImage {
-                width,
-                height,
-                frames,
-                file_size,
-            })
-        }
-        "png" => {
-            let decoder = image::codecs::png::PngDecoder::new(cursor).ok()?;
-            if !decoder.is_apng().unwrap_or(false) {
-                return None;
-            }
-            let raw_frames: Vec<_> = decoder.apng().ok()?.into_frames().collect_frames().ok()?;
-            if raw_frames.len() <= 1 {
-                return None;
-            }
-            let width = raw_frames[0].buffer().width();
-            let height = raw_frames[0].buffer().height();
-            let frames = raw_frames
-                .into_iter()
-                .map(|f| {
-                    let (numer, denom) = f.delay().numer_denom_ms();
-                    let ms = if denom == 0 {
-                        100
-                    } else {
-                        (numer / denom).max(10)
-                    };
-                    let pixels = rgba_to_packed(f.buffer().as_raw());
-                    let mips = build_mips(width, height, &pixels);
-                    Frame {
-                        pixels,
-                        mips,
-                        delay: Duration::from_millis(ms as u64),
-                    }
-                })
-                .collect();
-            Some(DecodedImage {
-                width,
-                height,
-                frames,
-                file_size,
-            })
-        }
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gif" => Some(AnimKind::Gif),
+        "png" => Some(AnimKind::Apng),
         _ => None,
     }
+}
+
+fn make_stream(kind: AnimKind, bytes: &[u8]) -> Option<FrameStream> {
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    match kind {
+        AnimKind::Gif => {
+            let decoder = image::codecs::gif::GifDecoder::new(cursor).ok()?;
+            Some(decoder.into_frames())
+        }
+        AnimKind::Apng => {
+            let decoder = image::codecs::png::PngDecoder::new(cursor).ok()?;
+            if !decoder.is_apng().ok()? {
+                return None;
+            }
+            let apng = decoder.apng().ok()?;
+            Some(apng.into_frames())
+        }
+    }
+}
+
+fn frame_delay(f: &image::Frame) -> Duration {
+    let (numer, denom) = f.delay().numer_denom_ms();
+    let ms = if denom == 0 {
+        100
+    } else {
+        (numer / denom).max(10)
+    };
+    Duration::from_millis(ms as u64)
+}
+
+fn frame_pixels(f: &image::Frame, width: u32, height: u32) -> (Vec<u32>, Vec<Mip>) {
+    let pixels = rgba_to_packed(f.buffer().as_raw());
+    let mips = build_mips(width, height, &pixels);
+    (pixels, mips)
+}
+
+fn try_load_animated(path: &Path) -> Option<DecodedImage> {
+    let kind = anim_kind_for(path)?;
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let bytes = Arc::new(std::fs::read(path).ok()?);
+    // one pass to count frames and collect delays; pixels are decoded
+    // lazily during playback
+    let stream = make_stream(kind, &bytes)?;
+    let mut delays = Vec::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
+    for f in stream {
+        let f = f.ok()?;
+        width = f.buffer().width();
+        height = f.buffer().height();
+        delays.push(frame_delay(&f));
+    }
+    if delays.len() <= 1 {
+        return None; // not animated, fall back to normal loader
+    }
+    Some(DecodedImage {
+        width,
+        height,
+        data: ImageData::Animated(Animated {
+            kind,
+            bytes,
+            delays,
+        }),
+        file_size,
+    })
 }
 
 fn load_image(path: &Path) -> Option<DecodedImage> {
@@ -468,11 +505,7 @@ fn load_image(path: &Path) -> Option<DecodedImage> {
     Some(DecodedImage {
         width,
         height,
-        frames: vec![Frame {
-            pixels,
-            mips,
-            delay: Duration::ZERO,
-        }],
+        data: ImageData::Static(Frame { pixels, mips }),
         file_size,
     })
 }
@@ -605,6 +638,19 @@ struct RunningCommand {
     expanded: String,
 }
 
+/// The decoded frame currently on screen for an animated image, plus the
+/// stream positioned at the next frame — advancing decodes exactly one
+/// frame; on loop wrap the stream is restarted from the stored bytes.
+struct LiveAnim {
+    kind: AnimKind,
+    bytes: Arc<Vec<u8>>,
+    stream: FrameStream,
+    /// index the stream will produce next
+    next_index: usize,
+    pixels: Vec<u32>,
+    mips: Vec<Mip>,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
@@ -612,6 +658,7 @@ struct App {
     images: Vec<PathBuf>,
     index: usize,
     current: Option<Arc<DecodedImage>>,
+    anim: Option<LiveAnim>,
     image_cache: ImageCache,
     config: Config,
     running: Vec<RunningCommand>,
@@ -631,6 +678,7 @@ impl App {
             images,
             index,
             current: None,
+            anim: None,
             image_cache: ImageCache::new(),
             config,
             running: Vec::new(),
@@ -660,8 +708,7 @@ impl App {
         self.zoom = 1.0;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
-        self.frame_index = 0;
-        self.frame_start = Instant::now();
+        self.setup_anim();
         self.update_title();
         self.request_redraw();
         self.image_cache.request_preload(&self.images, self.index);
@@ -689,23 +736,64 @@ impl App {
         }
     }
 
+    /// Reset animation playback for the newly loaded image: decode frame 0
+    /// (if animated) and position the stream at frame 1.
+    fn setup_anim(&mut self) {
+        self.frame_index = 0;
+        self.frame_start = Instant::now();
+        self.anim = None;
+        let Some(img) = &self.current else { return };
+        let ImageData::Animated(a) = &img.data else {
+            return;
+        };
+        let (kind, bytes) = (a.kind, Arc::clone(&a.bytes));
+        let Some(mut stream) = make_stream(kind, &bytes) else {
+            return;
+        };
+        if let Some(Ok(f)) = stream.next() {
+            let (pixels, mips) = frame_pixels(&f, img.width, img.height);
+            self.anim = Some(LiveAnim {
+                kind,
+                bytes,
+                stream,
+                next_index: 1,
+                pixels,
+                mips,
+            });
+        }
+    }
+
     fn advance_animation(&mut self) -> Option<Instant> {
         let img = self.current.as_ref()?;
-        if !img.is_animated() {
+        let ImageData::Animated(anim) = &img.data else {
             return None;
-        }
-        let frame = &img.frames[self.frame_index % img.frames.len()];
-        let deadline = self.frame_start + frame.delay;
+        };
+        let len = anim.delays.len();
+        let idx = self.frame_index % len;
+        let deadline = self.frame_start + anim.delays[idx];
         let now = Instant::now();
-        if now >= deadline {
-            self.frame_index = (self.frame_index + 1) % img.frames.len();
-            self.frame_start = now;
-            self.request_redraw();
-            let next_delay = img.frames[self.frame_index].delay;
-            Some(now + next_delay)
-        } else {
-            Some(deadline)
+        if now < deadline {
+            return Some(deadline);
         }
+        let live = self.anim.as_mut()?;
+        let next = (idx + 1) % len;
+        if live.next_index != next {
+            // loop wrapped (next == 0): restart the stream from the bytes
+            live.stream = make_stream(live.kind, &live.bytes)?;
+            live.next_index = 0;
+        }
+        if live.next_index != next {
+            return None; // stream desynced beyond a wrap; stop playback
+        }
+        let f = live.stream.next()?.ok()?;
+        let (pixels, mips) = frame_pixels(&f, img.width, img.height);
+        live.pixels = pixels;
+        live.mips = mips;
+        live.next_index += 1;
+        self.frame_index = next;
+        self.frame_start = now;
+        self.request_redraw();
+        Some(now + anim.delays[next])
     }
 
     fn do_render(&mut self) {
@@ -735,13 +823,22 @@ impl App {
         let img_area_h = h.saturating_sub(BAR_HEIGHT);
 
         if let Some(img) = &self.current {
-            let frame = &img.frames[self.frame_index % img.frames.len()];
+            // static images render from the decoded frame; animations from
+            // the one live frame setup_anim/advance_animation maintain
+            const EMPTY_PX: &[u32] = &[];
+            const EMPTY_MIPS: &[Mip] = &[];
+            let (frame_pixels, frame_mips): (&[u32], &[Mip]) = match (&img.data, self.anim.as_ref())
+            {
+                (ImageData::Static(f), _) => (&f.pixels, &f.mips),
+                (ImageData::Animated(_), Some(live)) => (&live.pixels, &live.mips),
+                _ => (EMPTY_PX, EMPTY_MIPS),
+            };
             let iw = img.width as f64;
             let ih = img.height as f64;
             let ww = w as f64;
             let wh = img_area_h as f64;
 
-            let base_scale = (ww / iw).min(wh / ih).min(1.0);
+            let base_scale = fit_scale(img.width, img.height, w, img_area_h);
             let scale = base_scale * self.zoom;
 
             let scaled_w = (iw * scale) as i64;
@@ -764,8 +861,8 @@ impl App {
                 y_end,
                 img.width,
                 img.height,
-                &frame.pixels,
-                &frame.mips,
+                frame_pixels,
+                frame_mips,
                 scale,
                 scaled_w,
                 scaled_h,
@@ -784,7 +881,7 @@ impl App {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             let status = if let Some(img) = &self.current {
                 let anim_info = if img.is_animated() {
-                    format!(" | {} frames", img.frames.len())
+                    format!(" | {} frames", img.frame_count())
                 } else {
                     String::new()
                 };
@@ -937,9 +1034,25 @@ impl App {
                 self.image_cache.insert(key, img.clone());
                 self.current = Some(img);
             }
-            self.frame_index = 0;
-            self.frame_start = Instant::now();
+            self.setup_anim();
         }
+        self.request_redraw();
+    }
+
+    /// `1` key: view at actual pixels. zoom is relative to the fit scale,
+    /// so 1:1 means dividing the fit scale back out
+    fn zoom_to_actual_size(&mut self) {
+        let Some(window) = &self.window else { return };
+        let Some(img) = &self.current else { return };
+        let size = window.inner_size();
+        let base = fit_scale(
+            img.width,
+            img.height,
+            size.width,
+            size.height.saturating_sub(BAR_HEIGHT),
+        );
+        self.zoom = (1.0 / base).clamp(ZOOM_MIN, ZOOM_MAX);
+        self.clamp_pan();
         self.request_redraw();
     }
 
@@ -963,7 +1076,12 @@ impl App {
         let iw = img.width as f64;
         let ih = img.height as f64;
 
-        let base_scale = (ww / iw).min(wh / ih).min(1.0);
+        let base_scale = fit_scale(
+            img.width,
+            img.height,
+            size.width,
+            size.height.saturating_sub(BAR_HEIGHT),
+        );
         let scale = base_scale * self.zoom;
         let scaled_w = iw * scale;
         let scaled_h = ih * scale;
@@ -1038,6 +1156,10 @@ impl ApplicationHandler for App {
         self.context = Some(context);
         self.surface = Some(surface);
         self.update_title();
+        // the startup path sets `current` without load_current, so prime
+        // animation playback here too — otherwise the renderer has no live
+        // frame to draw
+        self.setup_anim();
         self.request_redraw();
         // start preloading neighbours of the initial image too
         self.image_cache.request_preload(&self.images, self.index);
@@ -1131,15 +1253,16 @@ impl ApplicationHandler for App {
                     "f" => self.toggle_fullscreen(),
                     "q" => event_loop.exit(),
                     "+" | "=" => {
-                        self.zoom = (self.zoom * 1.25).min(32.0);
+                        self.zoom = (self.zoom * 1.25).min(ZOOM_MAX);
                         self.clamp_pan();
                         self.request_redraw();
                     }
                     "-" => {
-                        self.zoom = (self.zoom / 1.25).max(0.1);
+                        self.zoom = (self.zoom / 1.25).max(ZOOM_MIN);
                         self.clamp_pan();
                         self.request_redraw();
                     }
+                    "1" => self.zoom_to_actual_size(),
                     "0" => {
                         self.zoom = 1.0;
                         self.pan_x = 0.0;
@@ -1225,11 +1348,10 @@ mod tests {
         Arc::new(DecodedImage {
             width: 1,
             height: 1,
-            frames: vec![Frame {
+            data: ImageData::Static(Frame {
                 pixels: vec![0],
                 mips: Vec::new(),
-                delay: Duration::ZERO,
-            }],
+            }),
             file_size: 0,
         })
     }
@@ -1408,5 +1530,59 @@ mod tests {
             );
         }
         eprintln!("blit 1920x{:?}: {:?}/frame", sh, t.elapsed() / 10);
+    }
+    #[test]
+    fn fit_scale_fits_without_upscaling() {
+        // width-limited: 2000x1000 into a 1000x900 image area
+        assert_eq!(fit_scale(2000, 1000, 1000, 900), 0.5);
+        // small images are never upscaled by the fit
+        assert_eq!(fit_scale(100, 100, 1000, 1000), 1.0);
+        // 1:1 zoom is the inverse of the fit scale (see zoom_to_actual_size)
+        assert_eq!(1.0 / fit_scale(2000, 1000, 1000, 900), 2.0);
+    }
+
+    #[test]
+    fn animated_gif_keeps_bytes_and_streams_frames_on_demand() {
+        let img = load_image(&fixture("anim.gif")).expect("fixture loads");
+        assert!(img.is_animated());
+        assert_eq!(img.frame_count(), 3);
+        assert_eq!((img.width, img.height), (40, 30));
+        let ImageData::Animated(a) = &img.data else {
+            panic!("expected animated data");
+        };
+        assert!(
+            a.delays.iter().all(|d| *d == Duration::from_millis(80)),
+            "delays: {:?}",
+            a.delays
+        );
+        // frames decode on demand from the stored bytes, in order
+        let mut stream = make_stream(a.kind, &a.bytes).expect("stream");
+        for &expected in &[0xff0000u32, 0x00ff00, 0x000080] {
+            let f = stream.next().expect("frame").expect("no decode error");
+            let (px, _) = frame_pixels(&f, img.width, img.height);
+            assert_eq!(px[0], expected);
+            assert_eq!(px[px.len() - 1], expected);
+        }
+        assert!(stream.next().is_none(), "stream ends after the last frame");
+        // restarting yields frame 0 again (loop wrap path)
+        let mut restart = make_stream(a.kind, &a.bytes).expect("stream");
+        let f = restart.next().unwrap().unwrap();
+        assert_eq!(frame_pixels(&f, img.width, img.height).0[0], 0xff0000);
+    }
+
+    #[test]
+    fn single_frame_gif_is_not_treated_as_animated() {
+        // oriented.jpg is a jpeg; anim.gif is animated — use a static png
+        let img = load_image(&fixture("alpha.png")).expect("fixture loads");
+        assert!(!img.is_animated());
+        assert_eq!(img.frame_count(), 1);
+    }
+    #[test]
+    fn blit_empty_frame_is_noop() {
+        // regression: animated image drawn before its live frame is primed
+        // used to read out of an empty slice
+        let mut buf = vec![BG; 16];
+        blit_scaled(&mut buf, 4, 0, 0, 4, 4, 64, 64, &[], &[], 1.0, 64, 64, 0, 0);
+        assert!(buf.iter().all(|&p| p == BG));
     }
 }

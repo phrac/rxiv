@@ -31,7 +31,8 @@ Pass an image file or a directory. Defaults to the current directory. The window
 | Del | Delete current image |
 | + / = | Zoom in |
 | - | Zoom out |
-| 0 | Reset zoom/pan |
+| 1 | Zoom to 1:1 (actual pixels) |
+| 0 | Reset zoom/pan (fit to window) |
 | Arrow keys | Pan (when zoomed) |
 | q / Esc | Quit (Esc exits fullscreen first) |
 
