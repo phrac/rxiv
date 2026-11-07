@@ -288,66 +288,122 @@ fn load_image(path: &Path) -> Option<DecodedImage> {
     })
 }
 
+/// Cache key: the file plus its mtime, so an image modified in place by an
+/// external command can never return a stale hit, and list changes (delete)
+/// never shift meaning between key and file.
+type CacheKey = (PathBuf, Option<SystemTime>);
+
+fn cache_key(path: &Path) -> CacheKey {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    (path.to_path_buf(), mtime)
+}
+
+/// decoded images kept warm while browsing; entries are Arc'd so the
+/// on-screen image and the cache share pixels
+const CACHE_CAP: usize = 6;
+/// how many positions around the current image to keep preloaded
+const PRELOAD_AHEAD: usize = 2;
+
 struct ImageCache {
-    cache: HashMap<usize, DecodedImage>,
-    tx: mpsc::Sender<(usize, PathBuf)>,
-    rx: mpsc::Receiver<(usize, DecodedImage)>,
-    pending: Arc<Mutex<usize>>, // generation counter to discard stale results
-    generation: usize,
+    entries: HashMap<CacheKey, Arc<DecodedImage>>,
+    last_use: HashMap<CacheKey, u64>,
+    tick: u64,
+    tx: mpsc::Sender<(usize, CacheKey)>,
+    rx: mpsc::Receiver<(CacheKey, Arc<DecodedImage>)>,
+    /// index currently on screen — the decode thread uses it to prioritise
+    /// and to drop requests that navigation has left behind
+    current: Arc<Mutex<usize>>,
 }
 
 impl ImageCache {
     fn new() -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<(usize, PathBuf)>();
-        let (res_tx, res_rx) = mpsc::channel::<(usize, DecodedImage)>();
-        let pending = Arc::new(Mutex::new(0usize));
-        let bg_pending = Arc::clone(&pending);
+        let (req_tx, req_rx) = mpsc::channel::<(usize, CacheKey)>();
+        let (res_tx, res_rx) = mpsc::channel::<(CacheKey, Arc<DecodedImage>)>();
+        let current = Arc::new(Mutex::new(usize::MAX / 2));
+        let bg_current = Arc::clone(&current);
 
         std::thread::spawn(move || {
-            while let Ok((idx, path)) = req_rx.recv() {
-                let gen_before = *bg_pending.lock().unwrap();
-                if let Some(img) = load_image(&path) {
-                    let gen_after = *bg_pending.lock().unwrap();
-                    if gen_before == gen_after {
-                        let _ = res_tx.send((idx, img));
+            while let Ok(first) = req_rx.recv() {
+                // collapse the whole queue, decode what is closest to the
+                // visible image first, and skip work navigation outran
+                let mut batch = vec![first];
+                while let Ok(r) = req_rx.try_recv() {
+                    batch.push(r);
+                }
+                let cur = *bg_current.lock().unwrap();
+                batch.sort_by_key(|(idx, _)| idx.abs_diff(cur));
+                batch.dedup_by(|(a, _), (b, _)| a == b);
+                for (idx, key) in batch {
+                    if idx.abs_diff(cur) > PRELOAD_AHEAD + 2 {
+                        continue;
+                    }
+                    if let Some(img) = load_image(&key.0) {
+                        let _ = res_tx.send((key, Arc::new(img)));
                     }
                 }
             }
         });
 
         Self {
-            cache: HashMap::new(),
+            entries: HashMap::new(),
+            last_use: HashMap::new(),
+            tick: 0,
             tx: req_tx,
             rx: res_rx,
-            pending,
-            generation: 0,
+            current,
         }
     }
 
-    fn drain_ready(&mut self) {
-        while let Ok((idx, img)) = self.rx.try_recv() {
-            self.cache.insert(idx, img);
+    fn touch(&mut self, key: &CacheKey) {
+        self.tick += 1;
+        self.last_use.insert(key.clone(), self.tick);
+    }
+
+    fn insert(&mut self, key: CacheKey, img: Arc<DecodedImage>) {
+        self.touch(&key);
+        self.entries.insert(key, img);
+        if self.entries.len() > CACHE_CAP {
+            // evict the least recently used entry that is not still on
+            // screen; if everything is pinned, let the cap slide one
+            let victim = self
+                .last_use
+                .iter()
+                .filter(|(k, _)| {
+                    self.entries
+                        .get(*k)
+                        .is_some_and(|v| Arc::strong_count(v) == 1)
+                })
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = victim {
+                self.entries.remove(&k);
+                self.last_use.remove(&k);
+            }
         }
     }
 
-    fn take(&mut self, idx: usize) -> Option<DecodedImage> {
-        self.drain_ready();
-        self.cache.remove(&idx)
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<DecodedImage>> {
+        while let Ok((k, img)) = self.rx.try_recv() {
+            self.insert(k, img);
+        }
+        let img = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(img)
     }
 
     fn request_preload(&mut self, images: &[PathBuf], center: usize) {
-        self.generation += 1;
-        *self.pending.lock().unwrap() = self.generation;
-        self.cache.clear();
-        // drain any stale results
-        while self.rx.try_recv().is_ok() {}
-
+        *self.current.lock().unwrap() = center;
         let len = images.len();
-        for delta in [1isize, -1] {
+        for delta in [1isize, -1, 2, -2] {
             let idx = (center as isize + delta).rem_euclid(len as isize) as usize;
-            if idx != center {
-                let _ = self.tx.send((idx, images[idx].clone()));
+            if idx == center {
+                continue;
             }
+            let key = cache_key(&images[idx]);
+            if self.entries.contains_key(&key) {
+                continue;
+            }
+            let _ = self.tx.send((idx, key));
         }
     }
 }
@@ -366,7 +422,7 @@ struct App {
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
     images: Vec<PathBuf>,
     index: usize,
-    current: Option<DecodedImage>,
+    current: Option<Arc<DecodedImage>>,
     image_cache: ImageCache,
     config: Config,
     running: Vec<RunningCommand>,
@@ -398,9 +454,20 @@ impl App {
     }
 
     fn load_current(&mut self) {
-        self.current = self.image_cache.take(self.index).or_else(|| {
-            self.images.get(self.index).and_then(|p| load_image(p))
-        });
+        // tell the decode thread where we are before any (blocking) decode,
+        // so it can drop requests for images we sailed past
+        *self.image_cache.current.lock().unwrap() = self.index;
+        self.current = None;
+        if let Some(path) = self.images.get(self.index).cloned() {
+            let key = cache_key(&path);
+            if let Some(img) = self.image_cache.get(&key) {
+                self.current = Some(img);
+            } else if let Some(img) = load_image(&path) {
+                let img = Arc::new(img);
+                self.image_cache.insert(key, img.clone());
+                self.current = Some(img);
+            }
+        }
         self.zoom = 1.0;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
@@ -683,11 +750,19 @@ impl App {
     }
 
     /// Reload the current image in place, keeping zoom/pan — used when an
-    /// external command has modified the file.
+    /// external command has modified the file. The cache is keyed by mtime,
+    /// so the old decode can no longer produce a hit.
     fn reload_current(&mut self) {
         self.current = None;
         if let Some(path) = self.images.get(self.index).cloned() {
-            self.current = load_image(&path);
+            let key = cache_key(&path);
+            if let Some(img) = self.image_cache.get(&key) {
+                self.current = Some(img);
+            } else if let Some(img) = load_image(&path) {
+                let img = Arc::new(img);
+                self.image_cache.insert(key, img.clone());
+                self.current = Some(img);
+            }
             self.frame_index = 0;
             self.frame_start = Instant::now();
         }
@@ -732,9 +807,17 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // preload image to determine window size
+        // preload image to determine window size (and warm the cache so the
+        // first navigation doesn't re-decode it)
         if self.current.is_none() {
-            self.current = self.images.get(self.index).and_then(|p| load_image(p));
+            if let Some(path) = self.images.get(self.index) {
+                let key = cache_key(path);
+                self.current = load_image(path).map(|img| {
+                    let img = Arc::new(img);
+                    self.image_cache.insert(key, img.clone());
+                    img
+                });
+            }
         }
 
         // determine window size: image dims clamped to monitor, or 800x600 fallback
@@ -782,6 +865,8 @@ impl ApplicationHandler for App {
         self.surface = Some(surface);
         self.update_title();
         self.request_redraw();
+        // start preloading neighbours of the initial image too
+        self.image_cache.request_preload(&self.images, self.index);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -963,5 +1048,54 @@ mod tests {
         assert!((138..=142).contains(&r), "r={r}");
         assert_eq!(out[1], BG, "fully transparent maps to background");
         assert_eq!(out[2], 0x010203, "opaque pixels pass through");
+    }
+    fn dummy_image() -> Arc<DecodedImage> {
+        Arc::new(DecodedImage {
+            width: 1,
+            height: 1,
+            frames: vec![Frame {
+                pixels: vec![0],
+                delay: Duration::ZERO,
+            }],
+            file_size: 0,
+        })
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_beyond_cap() {
+        let mut c = ImageCache::new();
+        let keys: Vec<CacheKey> = (0..CACHE_CAP + 2)
+            .map(|i| (PathBuf::from(format!("img{i}")), None))
+            .collect();
+        for k in &keys {
+            c.insert(k.clone(), dummy_image());
+        }
+        assert_eq!(c.entries.len(), CACHE_CAP);
+        assert!(!c.entries.contains_key(&keys[0]), "oldest evicted");
+        assert!(c.entries.contains_key(&keys[keys.len() - 1]));
+        // touching an entry protects it from the next eviction
+        let protect = keys[2].clone();
+        assert!(c.get(&protect).is_some());
+        c.insert((PathBuf::from("another"), None), dummy_image());
+        assert!(c.entries.contains_key(&protect), "recently used survives");
+        assert!(!c.entries.contains_key(&keys[1]), "next-oldest evicted instead");
+    }
+
+    #[test]
+    fn cache_key_changes_when_file_modified() {
+        let path = fixture("alpha.png");
+        let before = cache_key(&path);
+        let orig = before.1.expect("fixture has mtime");
+        let later = std::time::SystemTime::UNIX_EPOCH
+            + orig.duration_since(std::time::UNIX_EPOCH).unwrap()
+            + Duration::from_secs(10);
+        let times = std::fs::FileTimes::new().set_modified(later);
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_times(times).unwrap();
+        drop(f);
+        assert_ne!(cache_key(&path), before, "modified file must miss cache");
+        // restore so the fixture stays stable
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(orig)).unwrap();
     }
 }
