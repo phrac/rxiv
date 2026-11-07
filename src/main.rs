@@ -1,13 +1,13 @@
-use image::AnimationDecoder;
+use image::{AnimationDecoder, DynamicImage, ImageDecoder};
 use serde::Deserialize;
 use softbuffer::{Context, Surface};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
@@ -86,6 +86,9 @@ const BAR_HEIGHT: u32 = 20;
 const BAR_BG: u32 = 0x222222;
 const BAR_FG: u32 = 0xcccccc;
 
+/// canvas background; images are composited over this at decode time
+const BG: u32 = 0x1a1a1a;
+
 const FONT_W: u32 = 6;
 const FONT_H: u32 = 10;
 
@@ -128,16 +131,32 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Convert RGBA to packed 0xRRGGBB composited over the background, so
+/// transparent regions show the background rather than black and
+/// semi-transparent edges get no dark halo.
 fn rgba_to_packed(rgba: &[u8]) -> Vec<u32> {
+    let (bgr, bgg, bgb) = ((BG >> 16) & 0xff, (BG >> 8) & 0xff, BG & 0xff);
     rgba.chunks_exact(4)
         .map(|c| {
-            let [r, g, b, a] = [c[0] as u32, c[1] as u32, c[2] as u32, c[3] as u32];
-            let r = r * a / 255;
-            let g = g * a / 255;
-            let b = b * a / 255;
+            let a = c[3] as u32;
+            if a == 255 {
+                return ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+            }
+            if a == 0 {
+                return BG;
+            }
+            let inv = 255 - a;
+            let r = (c[0] as u32 * a + bgr * inv) / 255;
+            let g = (c[1] as u32 * a + bgg * inv) / 255;
+            let b = (c[2] as u32 * a + bgb * inv) / 255;
             r << 16 | g << 8 | b
         })
         .collect()
+}
+
+/// Quote a string for safe interpolation into a `sh -c` command line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 struct Frame {
@@ -246,7 +265,14 @@ fn load_image(path: &Path) -> Option<DecodedImage> {
     // misnamed files (e.g. webp saved as .jpg) still load
     let reader = image::ImageReader::open(path).ok()?;
     let reader = reader.with_guessed_format().ok()?;
-    let img = reader.decode().ok()?;
+    // decode through the decoder so EXIF orientation can be applied —
+    // decode() alone leaves phone photos sideways
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
     let (width, height) = (img.width(), img.height());
     let rgba = img.to_rgba8();
     let pixels = rgba_to_packed(rgba.as_raw());
@@ -326,6 +352,14 @@ impl ImageCache {
     }
 }
 
+/// A configured key command that is still running in the background.
+struct RunningCommand {
+    child: std::process::Child,
+    path: PathBuf,
+    mtime_before: Option<SystemTime>,
+    expanded: String,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
@@ -335,6 +369,7 @@ struct App {
     current: Option<DecodedImage>,
     image_cache: ImageCache,
     config: Config,
+    running: Vec<RunningCommand>,
     zoom: f64,
     pan_x: f64,
     pan_y: f64,
@@ -353,6 +388,7 @@ impl App {
             current: None,
             image_cache: ImageCache::new(),
             config,
+            running: Vec::new(),
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
@@ -571,36 +607,91 @@ impl App {
         if self.images.is_empty() {
             return;
         }
-        let path = &self.images[self.index];
-        let expanded = cmd.replace("$file", &path.to_string_lossy());
-        let status = std::process::Command::new("sh")
+        let path = self.images[self.index].clone();
+        // quote the path so names with spaces survive shell expansion
+        let expanded = cmd.replace("$file", &shell_quote(&path.to_string_lossy()));
+        let mtime_before = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        // spawn without waiting so launching e.g. gimp doesn't freeze the UI;
+        // reap_commands() picks up the result later
+        match std::process::Command::new("sh")
             .arg("-c")
             .arg(&expanded)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                // if the file was removed/moved, drop it from the list
-                if !path.exists() {
-                    self.images.remove(self.index);
+            .spawn()
+        {
+            Ok(child) => self.running.push(RunningCommand {
+                child,
+                path,
+                mtime_before,
+                expanded,
+            }),
+            Err(e) => eprintln!("failed to run command: {}: {}", expanded, e),
+        }
+    }
+
+    /// Check finished background commands: drop files the command
+    /// removed/moved, and reload files it modified in place (e.g. rotate).
+    fn reap_commands(&mut self) {
+        if self.running.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.running.len() {
+            let done = match self.running[i].child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!("command exited with {}: {}", status, self.running[i].expanded);
+                    }
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if !done {
+                i += 1;
+                continue;
+            }
+            let mut rc = self.running.swap_remove(i);
+            let _ = rc.child.wait(); // reap
+            if !rc.path.exists() {
+                // file was removed/moved — drop it from the list
+                if let Some(pos) = self.images.iter().position(|p| p == &rc.path) {
+                    self.images.remove(pos);
                     if self.images.is_empty() {
                         self.current = None;
                         self.update_title();
                         self.request_redraw();
-                        return;
+                        continue;
                     }
-                    if self.index >= self.images.len() {
-                        self.index = self.images.len() - 1;
+                    if pos == self.index {
+                        if self.index >= self.images.len() {
+                            self.index = self.images.len() - 1;
+                        }
+                        self.load_current();
+                    } else if pos < self.index {
+                        self.index -= 1;
                     }
-                    self.load_current();
+                }
+            } else {
+                // file may have been modified in place (rotate, mogrify, ...)
+                let now = std::fs::metadata(&rc.path).and_then(|m| m.modified()).ok();
+                let is_current = self.images.get(self.index).is_some_and(|p| p == &rc.path);
+                if is_current && now != rc.mtime_before {
+                    self.reload_current();
                 }
             }
-            Ok(s) => {
-                eprintln!("command exited with {}: {}", s, expanded);
-            }
-            Err(e) => {
-                eprintln!("failed to run command: {}: {}", expanded, e);
-            }
         }
+    }
+
+    /// Reload the current image in place, keeping zoom/pan — used when an
+    /// external command has modified the file.
+    fn reload_current(&mut self) {
+        self.current = None;
+        if let Some(path) = self.images.get(self.index).cloned() {
+            self.current = load_image(&path);
+            self.frame_index = 0;
+            self.frame_start = Instant::now();
+        }
+        self.request_redraw();
     }
 
     fn toggle_fullscreen(&self) {
@@ -668,10 +759,13 @@ impl ApplicationHandler for App {
             (800, 600)
         };
 
+        // win_w/win_h are physical pixels (monitor size is physical), so pass
+        // them as a PhysicalSize — LogicalSize makes the window scale-factor
+        // times too big on HiDPI displays
         let attrs = Window::default_attributes()
             .with_title("rxiv")
             .with_name("rxiv", "rxiv")
-            .with_inner_size(LogicalSize::new(win_w, win_h));
+            .with_inner_size(PhysicalSize::new(win_w, win_h));
 
         let window = Arc::new(
             event_loop
@@ -691,10 +785,20 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(deadline) = self.advance_animation() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        self.reap_commands();
+        let anim = self.advance_animation();
+        // poll soon while background commands run, so their file changes
+        // show up without waiting for user input
+        let poll = if self.running.is_empty() {
+            None
         } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            Some(Instant::now() + Duration::from_millis(300))
+        };
+        match (anim, poll) {
+            (Some(a), Some(p)) => event_loop.set_control_flow(ControlFlow::WaitUntil(a.min(p))),
+            (Some(a), None) => event_loop.set_control_flow(ControlFlow::WaitUntil(a)),
+            (None, Some(p)) => event_loop.set_control_flow(ControlFlow::WaitUntil(p)),
+            (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -826,4 +930,38 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App::new(images, index, config);
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn exif_orientation_is_applied() {
+        // stored as 6x2 with orientation "Rotate 90 CW" -> must load as 2x6
+        let img = load_image(&fixture("oriented.jpg")).expect("fixture loads");
+        assert_eq!((img.width, img.height), (2, 6));
+    }
+
+    #[test]
+    fn shell_quotes_paths() {
+        assert_eq!(shell_quote("/a/b c.png"), "'/a/b c.png'");
+        assert_eq!(shell_quote("it's.png"), r"'it'\''s.png'");
+    }
+
+    #[test]
+    fn alpha_composites_over_background() {
+        let out = rgba_to_packed(&[255, 0, 0, 128, 9, 9, 9, 0, 1, 2, 3, 255]);
+        // red toward BG at a=128: (255*128 + 0x1a*127) / 255 = 140
+        let r = (out[0] >> 16) & 0xff;
+        assert!((138..=142).contains(&r), "r={r}");
+        assert_eq!(out[1], BG, "fully transparent maps to background");
+        assert_eq!(out[2], 0x010203, "opaque pixels pass through");
+    }
 }
