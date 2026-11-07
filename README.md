@@ -2,6 +2,10 @@
 
 Fast, minimal image viewer in Rust. No UI chrome — just the picture.
 
+- Wide format support, EXIF-rotated phone photos shown upright
+- Mipmapped downscaling and smooth upscaling — CPU-rendered, no GPU needed
+- Neighbour preloading with an LRU decode cache
+
 ## Install
 
 ```

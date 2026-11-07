@@ -3,7 +3,10 @@
 # (usually ~/.config/rxiv/config.toml)
 
 # Custom keybindings
-# Map a key to a shell command. $file is replaced with the current image path.
+# Map a key to a shell command. $file is replaced with the current image
+# path (shell-quoted). Commands run in the background; if one modifies the
+# file in place the image reloads, and if it removes/moves the file it
+# drops off the list.
 [keys]
 # d = "mv $file ~/.local/share/Trash/files/"
 # w = "feh --bg-fill $file"

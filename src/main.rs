@@ -4,7 +4,7 @@ use softbuffer::{Context, Surface};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -15,8 +15,8 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Window, WindowId};
 
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "ico", "pnm", "pbm", "pgm",
-    "ppm", "qoi",
+    "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "ico", "pnm", "pbm", "pgm", "ppm",
+    "qoi",
 ];
 
 #[derive(Deserialize, Default)]
@@ -106,6 +106,9 @@ fn draw_char(buf: &mut [u32], buf_w: u32, x: u32, y: u32, ch: char, fg: u32) {
         for col in 0..FONT_W {
             if bits & (0x80 >> col) != 0 {
                 let px = x + col;
+                if px >= buf_w {
+                    break; // clip at the row edge instead of wrapping into it
+                }
                 let off = (py * buf_w + px) as usize;
                 if off < buf.len() {
                     buf[off] = fg;
@@ -159,8 +162,186 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// A box-filtered halving level of a frame; mips[0] is 1/2 scale.
+/// Kept next to the full-res pixels so downscaling samples a level close
+/// to the output size instead of nearest-neighbour subsampling (moiré).
+#[derive(Clone)]
+struct Mip {
+    width: u32,
+    height: u32,
+    pixels: Vec<u32>,
+}
+
+/// 2x2 box average into a halving level; odd edges duplicate the last pixel.
+fn box2(src: &[u32], w: u32, h: u32) -> (u32, u32, Vec<u32>) {
+    let nw = w.div_ceil(2).max(1);
+    let nh = h.div_ceil(2).max(1);
+    let mut dst = vec![0u32; (nw * nh) as usize];
+    for y in 0..nh {
+        let y0 = ((y * 2).min(h - 1) as usize) * w as usize;
+        let y1 = ((y * 2 + 1).min(h - 1) as usize) * w as usize;
+        for x in 0..nw {
+            let x0 = (x * 2).min(w - 1) as usize;
+            let x1 = (x * 2 + 1).min(w - 1) as usize;
+            let (a, b, c, d) = (src[y0 + x0], src[y0 + x1], src[y1 + x0], src[y1 + x1]);
+            let avg = |sh: u32| {
+                ((a >> sh) & 0xff) + ((b >> sh) & 0xff) + ((c >> sh) & 0xff) + ((d >> sh) & 0xff)
+            };
+            dst[(y * nw + x) as usize] = (avg(16) / 4) << 16 | (avg(8) / 4) << 8 | avg(0) / 4;
+        }
+    }
+    (nw, nh, dst)
+}
+
+/// Halving chain from 1/2 scale down; stops once both dims reach 8.
+fn build_mips(width: u32, height: u32, pixels: &[u32]) -> Vec<Mip> {
+    if width <= 16 && height <= 16 {
+        return Vec::new(); // sampler can bilinear from full-res fine at this size
+    }
+    let (w, h, p) = box2(pixels, width, height);
+    let mut level = Mip {
+        width: w,
+        height: h,
+        pixels: p,
+    };
+    let mut mips = Vec::new();
+    loop {
+        let (w, h, p) = box2(&level.pixels, level.width, level.height);
+        mips.push(std::mem::replace(
+            &mut level,
+            Mip {
+                width: w,
+                height: h,
+                pixels: p,
+            },
+        ));
+        if level.width <= 8 && level.height <= 8 {
+            mips.push(level);
+            break;
+        }
+    }
+    mips
+}
+
+/// deepest level (full-res counts as level 0) still covering target size
+fn pick_level<'a>(
+    width: u32,
+    height: u32,
+    pixels: &'a [u32],
+    mips: &'a [Mip],
+    target_w: i64,
+    target_h: i64,
+) -> (usize, usize, &'a [u32]) {
+    let mut best = (width as usize, height as usize, pixels);
+    for m in mips {
+        if m.width as i64 >= target_w && m.height as i64 >= target_h {
+            best = (m.width as usize, m.height as usize, &m.pixels);
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+/// Draw one frame of an image into the framebuffer, choosing the best
+/// sampler for the scale: nearest at ~1:1 and deliberate big upscale,
+/// bilinear from the deepest covering mip otherwise.
+#[allow(clippy::too_many_arguments)]
+fn blit_scaled(
+    buf: &mut [u32],
+    buf_w: usize,
+    x_start: u32,
+    y_start: u32,
+    x_end: u32,
+    y_end: u32,
+    img_w: u32,
+    img_h: u32,
+    pixels: &[u32],
+    mips: &[Mip],
+    scale: f64,
+    scaled_w: i64,
+    scaled_h: i64,
+    ox: i64,
+    oy: i64,
+) {
+    let x_span = x_end.saturating_sub(x_start) as usize;
+    let y_span = y_end.saturating_sub(y_start) as usize;
+    if x_span == 0 || y_span == 0 || !(scale.is_finite() && scale > 0.0) {
+        return;
+    }
+
+    // deepest mip level still covering the target size: sampling from
+    // there means at most ~2x reduction per output pixel, where bilinear
+    // behaves like a box filter and kills the moiré a full-res nearest
+    // subsample would show
+    let (lv_w, lv_h, lv) = pick_level(img_w, img_h, pixels, mips, scaled_w, scaled_h);
+
+    // level-space -> screen fixed-point inverse scale (16.16); sampling at
+    // dest pixel centres adds half a source pixel, removes half a dest pixel
+    let level_scale = scaled_w.max(1) as f64 / lv_w.max(1) as f64;
+    let inv_scale = (lv_w.max(1) as f64 / (img_w as f64 * scale) * 65536.0)
+        .clamp(1.0, (u32::MAX >> 1) as f64) as i64;
+    let half_px = (inv_scale >> 1) - 32768;
+
+    // nearest is crisp at ~1:1 and deliberately blocky at big zoom-in;
+    // everything else bilinear
+    let nearest = (0.98..=1.02).contains(&level_scale) || level_scale >= 2.0;
+
+    if nearest {
+        let src_x_table: Vec<usize> = (x_start..x_end)
+            .map(|wx| (((wx as i64 - ox) * inv_scale) >> 16).clamp(0, lv_w as i64 - 1) as usize)
+            .collect();
+        for wy in y_start..y_end {
+            let src_y = (((wy as i64 - oy) * inv_scale) >> 16).clamp(0, lv_h as i64 - 1) as usize;
+            let row_offset = src_y * lv_w;
+            let buf_row = wy as usize * buf_w;
+
+            // SAFETY: x_start..x_end is clamped to 0..buf_w by the caller,
+            // so buf_row + x < buf.len(); src_x/src_y are clamped into the
+            // level, so row_offset + src_x < lv.len()
+            unsafe {
+                for (i, &src_x) in src_x_table.iter().enumerate() {
+                    let px = *lv.get_unchecked(row_offset + src_x);
+                    *buf.get_unchecked_mut(buf_row + x_start as usize + i) = px;
+                }
+            }
+        }
+    } else {
+        // x taps/weights depend only on the x span, so compute them once
+        // per blit, not per row
+        let taps: Vec<(usize, usize, u32)> = (x_start..x_end)
+            .map(|wx| {
+                let v = ((wx as i64 - ox) * inv_scale + half_px).max(0);
+                let x0 = ((v >> 16) as usize).min(lv_w - 1);
+                (x0, (x0 + 1).min(lv_w - 1), ((v >> 8) & 0xff) as u32)
+            })
+            .collect();
+        let lerp = |p: u32, q: u32, t: u32| -> u32 {
+            let r = (((p >> 16) & 0xff) * (255 - t) + ((q >> 16) & 0xff) * t) / 255;
+            let g = (((p >> 8) & 0xff) * (255 - t) + ((q >> 8) & 0xff) * t) / 255;
+            let b = ((p & 0xff) * (255 - t) + (q & 0xff) * t) / 255;
+            r << 16 | g << 8 | b
+        };
+        for wy in y_start..y_end {
+            let v = ((wy as i64 - oy) * inv_scale + half_px).max(0);
+            let y0 = ((v >> 16) as usize).min(lv_h - 1);
+            let yw = ((v >> 8) & 0xff) as u32;
+            let y1 = (y0 + 1).min(lv_h - 1);
+            let r0 = y0 * lv_w;
+            let r1 = y1 * lv_w;
+            let dst = wy as usize * buf_w + x_start as usize;
+            for (i, &(x0, x1, xwt)) in taps.iter().enumerate() {
+                let top = lerp(lv[r0 + x0], lv[r0 + x1], xwt);
+                let bot = lerp(lv[r1 + x0], lv[r1 + x1], xwt);
+                buf[dst + i] = lerp(top, bot, yw);
+            }
+        }
+    }
+}
+
 struct Frame {
     pixels: Vec<u32>,
+    mips: Vec<Mip>,
     delay: Duration,
 }
 
@@ -205,8 +386,11 @@ fn try_load_animated(path: &Path) -> Option<DecodedImage> {
                     } else {
                         (numer / denom).max(10)
                     };
+                    let pixels = rgba_to_packed(f.buffer().as_raw());
+                    let mips = build_mips(width, height, &pixels);
                     Frame {
-                        pixels: rgba_to_packed(f.buffer().as_raw()),
+                        pixels,
+                        mips,
                         delay: Duration::from_millis(ms as u64),
                     }
                 })
@@ -238,8 +422,11 @@ fn try_load_animated(path: &Path) -> Option<DecodedImage> {
                     } else {
                         (numer / denom).max(10)
                     };
+                    let pixels = rgba_to_packed(f.buffer().as_raw());
+                    let mips = build_mips(width, height, &pixels);
                     Frame {
-                        pixels: rgba_to_packed(f.buffer().as_raw()),
+                        pixels,
+                        mips,
                         delay: Duration::from_millis(ms as u64),
                     }
                 })
@@ -277,11 +464,13 @@ fn load_image(path: &Path) -> Option<DecodedImage> {
     let rgba = img.to_rgba8();
     let pixels = rgba_to_packed(rgba.as_raw());
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mips = build_mips(width, height, &pixels);
     Some(DecodedImage {
         width,
         height,
         frames: vec![Frame {
             pixels,
+            mips,
             delay: Duration::ZERO,
         }],
         file_size,
@@ -541,13 +730,12 @@ impl App {
             Err(_) => return,
         };
 
-        let bg = 0x1a1a1au32;
-        buffer.fill(bg);
+        buffer.fill(BG);
 
         let img_area_h = h.saturating_sub(BAR_HEIGHT);
 
         if let Some(img) = &self.current {
-            let frame_pixels = &img.frames[self.frame_index % img.frames.len()].pixels;
+            let frame = &img.frames[self.frame_index % img.frames.len()];
             let iw = img.width as f64;
             let ih = img.height as f64;
             let ww = w as f64;
@@ -567,35 +755,23 @@ impl App {
             let x_end = (ox + scaled_w).max(0).min(w as i64) as u32;
             let y_end = (oy + scaled_h).max(0).min(img_area_h as i64) as u32;
 
-            // fixed-point inverse scale (16.16) to replace per-pixel f64 division
-            let inv_scale = (65536.0 / scale) as u64;
-            let img_w = img.width as usize;
-
-            // precompute src_x lookup table for the x span
-            let x_span = (x_end - x_start) as usize;
-            let mut src_x_table: Vec<u32> = Vec::with_capacity(x_span);
-            for wx in x_start..x_end {
-                src_x_table.push((((wx as i64 - ox) as u64 * inv_scale) >> 16) as u32);
-            }
-
-            let buf = buffer.as_mut();
-            for wy in y_start..y_end {
-                let src_y = (((wy as i64 - oy) as u64 * inv_scale) >> 16) as u32;
-                if src_y >= img.height {
-                    continue;
-                }
-                let row_offset = src_y as usize * img_w;
-                let buf_row = wy as usize * w as usize;
-
-                // SAFETY: x_start..x_end is clamped to 0..w, so buf_row + wx < w*h = buf.len()
-                // src_x < img.width and src_y < img.height, so row_offset + src_x < frame_pixels.len()
-                unsafe {
-                    for (i, &src_x) in src_x_table.iter().enumerate() {
-                        let px = *frame_pixels.get_unchecked(row_offset + src_x as usize);
-                        *buf.get_unchecked_mut(buf_row + x_start as usize + i) = px;
-                    }
-                }
-            }
+            blit_scaled(
+                buffer.as_mut(),
+                w as usize,
+                x_start,
+                y_start,
+                x_end,
+                y_end,
+                img.width,
+                img.height,
+                &frame.pixels,
+                &frame.mips,
+                scale,
+                scaled_w,
+                scaled_h,
+                ox,
+                oy,
+            );
         }
 
         // draw status bar background
@@ -623,12 +799,7 @@ impl App {
                     self.images.len()
                 )
             } else {
-                format!(
-                    " {} | {}/{}",
-                    name,
-                    self.index + 1,
-                    self.images.len()
-                )
+                format!(" {} | {}/{}", name, self.index + 1, self.images.len())
             };
             let text_y = img_area_h + (BAR_HEIGHT.saturating_sub(FONT_H)) / 2;
             draw_text(&mut buffer, w, 4, text_y, &status, BAR_FG);
@@ -706,7 +877,10 @@ impl App {
             let done = match self.running[i].child.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
-                        eprintln!("command exited with {}: {}", status, self.running[i].expanded);
+                        eprintln!(
+                            "command exited with {}: {}",
+                            status, self.running[i].expanded
+                        );
                     }
                     true
                 }
@@ -920,9 +1094,7 @@ impl ApplicationHandler for App {
                 ..
             } => match logical_key {
                 Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.navigate(1),
-                Key::Named(NamedKey::PageUp) | Key::Named(NamedKey::Backspace) => {
-                    self.navigate(-1)
-                }
+                Key::Named(NamedKey::PageUp) | Key::Named(NamedKey::Backspace) => self.navigate(-1),
                 Key::Named(NamedKey::Delete) => self.delete_current(),
                 Key::Named(NamedKey::Escape) => {
                     if self
@@ -1055,6 +1227,7 @@ mod tests {
             height: 1,
             frames: vec![Frame {
                 pixels: vec![0],
+                mips: Vec::new(),
                 delay: Duration::ZERO,
             }],
             file_size: 0,
@@ -1078,7 +1251,10 @@ mod tests {
         assert!(c.get(&protect).is_some());
         c.insert((PathBuf::from("another"), None), dummy_image());
         assert!(c.entries.contains_key(&protect), "recently used survives");
-        assert!(!c.entries.contains_key(&keys[1]), "next-oldest evicted instead");
+        assert!(
+            !c.entries.contains_key(&keys[1]),
+            "next-oldest evicted instead"
+        );
     }
 
     #[test]
@@ -1096,6 +1272,141 @@ mod tests {
         assert_ne!(cache_key(&path), before, "modified file must miss cache");
         // restore so the fixture stays stable
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        f.set_times(std::fs::FileTimes::new().set_modified(orig)).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(orig))
+            .unwrap();
+    }
+    #[test]
+    fn box2_averages_2x2_and_handles_odd_dims() {
+        // 3x3 -> 2x2
+        let src = vec![
+            0x000000, 0x000000, 0xffffff, 0x000000, 0x000000, 0xffffff, 0x808080, 0x808080,
+            0x000000,
+        ];
+        let (w, h, dst) = box2(&src, 3, 3);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(dst[0], 0x000000);
+        // odd edges duplicate the last pixel, so the right/bottom cells
+        // sample the doubled column/row
+        assert_eq!(dst[1], 0xffffff);
+        assert_eq!(dst[2], 0x808080);
+        assert_eq!(dst[3], 0x000000);
+        // even dims get true 2x2 averaging
+        let (_, _, dst) = box2(&[0x000000, 0xffffff, 0x000000, 0xffffff], 2, 2);
+        assert_eq!(dst[0], 0x7f7f7f, "(0+255+0+255)/4");
+    }
+
+    #[test]
+    fn mips_halve_until_small() {
+        let mips = build_mips(64, 32, &vec![0x123456; 64 * 32]);
+        assert_eq!((mips[0].width, mips[0].height), (32, 16));
+        let last = mips.last().unwrap();
+        assert!(
+            last.width <= 8 && last.height <= 8,
+            "chain terminates small"
+        );
+        assert!(
+            build_mips(16, 16, &vec![0u32; 256]).is_empty(),
+            "tiny images skip the chain"
+        );
+    }
+
+    #[test]
+    fn pick_level_selects_deepest_covering_level() {
+        let pixels = vec![0u32; 64 * 32];
+        let mips = build_mips(64, 32, &pixels);
+        // upscale -> full res
+        let (w, h, _) = pick_level(64, 32, &pixels, &mips, 100, 50);
+        assert_eq!((w, h), (64, 32));
+        // fit-downscale to 30x15 -> the 32x16 level, not full res
+        let (w, h, _) = pick_level(64, 32, &pixels, &mips, 30, 15);
+        assert_eq!((w, h), (32, 16));
+    }
+    #[test]
+    fn blit_1_to_1_copies_exactly() {
+        let img: Vec<u32> = (0..8).collect(); // 4x2: 0..3 / 4..7
+        let mut buf = vec![BG; 6 * 4];
+        blit_scaled(&mut buf, 6, 2, 1, 6, 3, 4, 2, &img, &[], 1.0, 4, 2, 2, 1);
+        assert_eq!(&buf[8..12], &[0, 1, 2, 3]);
+        assert_eq!(&buf[14..18], &[4, 5, 6, 7]);
+        assert!(
+            buf.iter()
+                .enumerate()
+                .all(|(i, &p)| (8..12).contains(&i) || (14..18).contains(&i) || p == BG)
+        );
+    }
+
+    #[test]
+    fn blit_bilinear_upscale_stays_in_source_range() {
+        let img = vec![0x000000, 0xffffff, 0xffffff, 0x000000]; // 2x2 checker
+        let mut buf = vec![BG; 3 * 3];
+        // 1.5x -> 3x3 bilinear upscale (level_scale 1.5 selects bilinear)
+        blit_scaled(&mut buf, 3, 0, 0, 3, 3, 2, 2, &img, &[], 1.5, 3, 3, 0, 0);
+        for &p in &buf {
+            for sh in [16, 8, 0] {
+                let c = (p >> sh) & 0xff;
+                assert!(c <= 255, "no overshoot");
+            }
+        }
+        // interior pixel must be a real blend of black and white
+        let mid = buf[4];
+        assert!(mid != BG && mid != 0 && mid != 0xffffff, "mid={mid:#x}");
+    }
+
+    #[test]
+    fn blit_survives_full_zoom_and_pan_sweep() {
+        let base: Vec<u32> = (0..64 * 32)
+            .map(|i| (i as u32).wrapping_mul(2654435761) & 0xffffff)
+            .collect();
+        let mips = build_mips(64, 32, &base);
+        let (bw, bh) = (90usize, 70usize);
+        let mut buf = vec![BG; bw * bh];
+        let area_h = 60i64; // leave a bar
+        for &zoom in &[
+            0.1, 0.2, 0.5, 0.7, 0.97, 1.0, 1.02, 1.3, 1.9, 2.0, 3.7, 8.0, 32.0,
+        ] {
+            let scale = (bw as f64 / 64.0).min(area_h as f64 / 32.0).min(1.0) * zoom;
+            let sw = (64.0 * scale) as i64;
+            let sh = (32.0 * scale) as i64;
+            for &(pan_x, pan_y) in &[(0.0, 0.0), (500.0, 500.0), (-500.0, -500.0), (47.3, -12.9)] {
+                let ox = ((bw as f64 - sw as f64) / 2.0 + pan_x) as i64;
+                let oy = ((area_h as f64 - sh as f64) / 2.0 + pan_y) as i64;
+                let x0 = ox.max(0) as u32;
+                let y0 = oy.max(0) as u32;
+                let x1 = (ox + sw).max(0).min(bw as i64) as u32;
+                let y1 = (oy + sh).max(0).min(area_h) as u32;
+                buf.fill(BG);
+                blit_scaled(
+                    &mut buf, bw, x0, y0, x1, y1, 64, 32, &base, &mips, scale, sw, sh, ox, oy,
+                );
+                // a pan that pushes the image fully off-canvas (beyond what
+                // clamp_pan allows in the app) must draw nothing, not wrap
+                let on_screen = x1 > x0 && y1 > y0;
+                let visible = buf[..area_h as usize * bw]
+                    .iter()
+                    .filter(|&&p| p != BG)
+                    .count();
+                assert_eq!(visible > 0, on_screen, "zoom {zoom} pan ({pan_x},{pan_y})");
+            }
+        }
+    }
+    #[test]
+    #[ignore = "manual perf check: cargo test --release -- --ignored --nocapture"]
+    fn bench_fullscreen_bilinear_blit() {
+        let base: Vec<u32> = (0..4000 * 3000).map(|i| i as u32 & 0xffffff).collect();
+        let t = Instant::now();
+        let mips = build_mips(4000, 3000, &base);
+        eprintln!("build_mips: {:?}", t.elapsed());
+        let mut buf = vec![BG; 1920 * 1050];
+        let scale: f64 = (1920.0f64 / 4000.0).min(1050.0 / 3000.0);
+        let (sw, sh) = ((4000.0 * scale) as i64, (3000.0 * scale) as i64);
+        let (ox, oy) = (((1920.0 - sw as f64) / 2.0) as i64, 0);
+        let t = Instant::now();
+        for _ in 0..10 {
+            blit_scaled(
+                &mut buf, 1920, 0, 0, sw as u32, sh as u32, 4000, 3000, &base, &mips, scale, sw,
+                sh, ox, oy,
+            );
+        }
+        eprintln!("blit 1920x{:?}: {:?}/frame", sh, t.elapsed() / 10);
     }
 }
